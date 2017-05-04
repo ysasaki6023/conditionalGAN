@@ -4,27 +4,6 @@ import numpy as np
 import argparse
 import cv2,math,glob,random,time
 
-"""
-class BatchGenerator:
-    def __init__(self):
-        self.folderPath = "celebA"
-        self.imagePath = glob.glob(self.folderPath+"/*.jpg")
-        #self.orgSize = (218,173)
-        self.imgSize = (108,108)
-        assert self.imgSize[0]==self.imgSize[1]
-
-    def getBatch(self,nBatch):
-        x   = np.zeros( (nBatch,self.imgSize[0],self.imgSize[1],3), dtype=np.float32)
-        for i in range(nBatch):
-            img = cv2.imread(self.imagePath[random.randint(0,len(self.imagePath)-1)])
-            dmin = min(img.shape[0],img.shape[1])
-            img = img[int(0.5*(img.shape[0]-dmin)):int(0.5*(img.shape[0]+dmin)),int(0.5*(img.shape[1]-dmin)):int(0.5*(img.shape[1]+dmin)),:]
-            img = cv2.resize(img,self.imgSize)
-            x[i,:,:,:] = (img - 128.) / 255. # normalize between -0.5 ~ +0.5 <- requirements from using tanh in the last processing in the Generator
-
-        return x,None
-"""
-
 class BatchGenerator:
     def __init__(self):
         from tensorflow.examples.tutorials.mnist import input_data
@@ -46,7 +25,7 @@ class BatchGenerator:
         return x,t
 
 class CGAN:
-    def __init__(self,isTraining,imageSize,args):
+    def __init__(self,isTraining,imageSize,labelSize,args):
         self.nBatch = args.nBatch
         self.learnRate = args.learnRate
         self.zdim = args.zdim
@@ -54,6 +33,7 @@ class CGAN:
         self.imageSize = imageSize
         self.saveFolder = args.saveFolder
         self.reload = args.reload
+        self.labelSize = labelSize
         self.buildModel()
 
         return
@@ -113,19 +93,21 @@ class CGAN:
     def loadModel(self, model_path=None):
         if model_path: self.saver.restore(self.sess, model_path)
 
-    def buildGenerator(self,z,reuse=False,isTraining=True):
+    def buildGenerator(self,z,label,reuse=False,isTraining=True):
         dim_0_h,dim_0_w = self.imageSize[0],self.imageSize[1]
         dim_1_h,dim_1_w = self.calcImageSize(dim_0_h, dim_0_w, stride=2)
         dim_2_h,dim_2_w = self.calcImageSize(dim_1_h, dim_1_w, stride=2)
         dim_3_h,dim_3_w = self.calcImageSize(dim_2_h, dim_2_w, stride=2)
 
-        h = z
-
         with tf.variable_scope("Generator") as scope:
             if reuse: scope.reuse_variables()
 
+            l = tf.one_hot(label,self.labelSize,name="label_onehot")
+
+            h = tf.concat([z,l],axis=1,name="concat_z")
+
             # fc1
-            self.g_fc1_w, self.g_fc1_b = self._fc_variable([self.zdim,256*dim_3_h*dim_3_w],name="fc1")
+            self.g_fc1_w, self.g_fc1_b = self._fc_variable([self.zdim+self.labelSize,256*dim_3_h*dim_3_w],name="fc1")
             h = tf.matmul(h, self.g_fc1_w) + self.g_fc1_b
             h = tf.nn.relu(h)
 
@@ -164,13 +146,19 @@ class CGAN:
 
         return y
 
-    def buildDiscriminator(self,y,reuse=False):
+    def buildDiscriminator(self,y,label,reuse=False):
         with tf.variable_scope("Discriminator") as scope:
             if reuse: scope.reuse_variables()
 
-            h = y
+            # conditional layer
+            l = tf.one_hot(label,self.labelSize,name="label_onehot")
+            l = tf.reshape(l,[self.nBatch,1,1,self.labelSize])
+            k = tf.ones([self.nBatch,self.imageSize[0],self.imageSize[1],self.labelSize])
+            k = k * l
+            h = tf.concat([y,k],axis=3)
+
             # conv1
-            self.d_conv1_w, self.d_conv1_b = self._conv_variable([5,5,3,64],name="conv1")
+            self.d_conv1_w, self.d_conv1_b = self._conv_variable([5,5,3+self.labelSize,64],name="conv1")
             h = self._conv2d(h,self.d_conv1_w, stride=2) + self.d_conv1_b
             h = tf.contrib.layers.batch_norm(h, decay=0.9, updates_collections=None, epsilon=1e-5, scale=True, is_training=self.isTraining, scope="dNorm1")
             h = self.leakyReLU(h)
@@ -209,13 +197,15 @@ class CGAN:
     def buildModel(self):
         # define variables
         self.z      = tf.placeholder(tf.float32, [self.nBatch, self.zdim],name="z")
+        self.l      = tf.placeholder(tf.int32  , [self.nBatch],name="label")
 
         self.y_real = tf.placeholder(tf.float32, [self.nBatch, self.imageSize[0], self.imageSize[1], 3],name="image")
-        self.y_fake = self.buildGenerator(self.z)
-        self.y_sample = self.buildGenerator(self.z,reuse=True,isTraining=False)
 
-        self.d_real  = self.buildDiscriminator(self.y_real)
-        self.d_fake  = self.buildDiscriminator(self.y_fake,reuse=True)
+        self.y_fake = self.buildGenerator(self.z,self.l)
+        self.y_sample = self.buildGenerator(self.z,self.l,reuse=True,isTraining=False)
+
+        self.d_real  = self.buildDiscriminator(self.y_real,self.l)
+        self.d_fake  = self.buildDiscriminator(self.y_fake,self.l,reuse=True)
 
         # define loss
         self.d_loss_real = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=self.d_real,labels=tf.ones_like (self.d_real)))
@@ -272,13 +262,13 @@ class CGAN:
         while True:
             step += 1
 
-            batch_images,_ = f_batch(self.nBatch)
-            batch_z        = np.random.uniform(-1.,+1.,[self.nBatch,self.zdim]).astype(np.float32)
+            batch_images,batch_labels = f_batch(self.nBatch)
+            batch_z                   = np.random.uniform(-1.,+1.,[self.nBatch,self.zdim]).astype(np.float32)
 
             # update generator
-            _,g_loss                = self.sess.run([self.g_optimizer,self.g_loss],feed_dict={self.z:batch_z})
-            _,g_loss                = self.sess.run([self.g_optimizer,self.g_loss],feed_dict={self.z:batch_z})
-            _,d_loss,y_fake,y_real,summary = self.sess.run([self.d_optimizer,self.d_loss,self.y_fake,self.y_real,self.summary],feed_dict={self.z:batch_z, self.y_real:batch_images})
+            _,g_loss                = self.sess.run([self.g_optimizer,self.g_loss],feed_dict={self.z:batch_z, self.l:batch_labels})
+            _,g_loss                = self.sess.run([self.g_optimizer,self.g_loss],feed_dict={self.z:batch_z, self.l:batch_labels})
+            _,d_loss,y_fake,y_real,summary = self.sess.run([self.d_optimizer,self.d_loss,self.y_fake,self.y_real,self.summary],feed_dict={self.z:batch_z, self.l:batch_labels, self.y_real:batch_images})
 
             if step>0 and step%10==0:
                 self.writer.add_summary(summary,step)
@@ -286,9 +276,16 @@ class CGAN:
             if step%100==0:
                 print "%6d: loss(D)=%.4e, loss(G)=%.4e; time/step = %.2f sec"%(step,d_loss,g_loss,time.time()-start)
                 start = time.time()
-                g_image = self.sess.run(self.y_sample,feed_dict={self.z:np.random.uniform(-1,+1,[self.nBatch,self.zdim]).astype(np.float32)})
+
+                l0 = np.array([x%10 for x in range(self.nBatch)],dtype=np.int32)
+                z1 = np.random.uniform(-1,+1,[self.nBatch,self.zdim])
+                z2 = np.random.uniform(-1,+1,[self.zdim])
+                z2 = np.expand_dims(z2,axis=0)
+                z2 = np.repeat(z2,repeats=self.nBatch,axis=0)
+
+                g_image1 = self.sess.run(self.y_sample,feed_dict={self.z:z1,self.l:l0})
+                g_image2 = self.sess.run(self.y_sample,feed_dict={self.z:z2,self.l:l0})
                 cv2.imwrite(os.path.join(self.saveFolder,"images","img_%d_real.png"%step),tileImage(y_real)*255.+128.)
-                cv2.imwrite(os.path.join(self.saveFolder,"images","img_%d_fake.png"%step),tileImage(y_fake)*255.+128.)
+                cv2.imwrite(os.path.join(self.saveFolder,"images","img_%d_fake1.png"%step),tileImage(g_image1)*255.+128.)
+                cv2.imwrite(os.path.join(self.saveFolder,"images","img_%d_fake2.png"%step),tileImage(g_image2)*255.+128.)
                 self.saver.save(self.sess,os.path.join(self.saveFolder,"model.ckpt"),step)
-            if step==0:
-                cv2.imwrite(os.path.join(self.saveFolder,"images","org_%d.png"%step),tileImage(batch_images)*255.+128.)

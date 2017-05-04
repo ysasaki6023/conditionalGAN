@@ -13,6 +13,6 @@ if __name__=="__main__":
     args.zdim = 100
 
     batch = BatchGenerator()
-    gan = CGAN(isTraining=True,imageSize=[28,28],args=args)
+    gan = CGAN(isTraining=True,imageSize=[28,28],labelSize=10,args=args)
 
     gan.train(f_batch=batch.getBatch)
