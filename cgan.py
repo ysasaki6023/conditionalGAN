@@ -4,6 +4,7 @@ import numpy as np
 import argparse
 import cv2,math,glob,random,time
 
+"""
 class BatchGenerator:
     def __init__(self):
         self.folderPath = "celebA"
@@ -22,8 +23,29 @@ class BatchGenerator:
             x[i,:,:,:] = (img - 128.) / 255. # normalize between -0.5 ~ +0.5 <- requirements from using tanh in the last processing in the Generator
 
         return x,None
+"""
 
-class DCGAN:
+class BatchGenerator:
+    def __init__(self):
+        from tensorflow.examples.tutorials.mnist import input_data
+        mnist = input_data.read_data_sets("MNIST_data/", one_hot=False)
+        self.image = mnist.train.images
+        self.image = np.reshape(self.image, [len(self.image), 28, 28])
+
+        self.label = mnist.train.labels
+
+        return
+
+    def getBatch(self,nBatch,color=True):
+        idx = np.random.randint(0,len(self.image)-1,nBatch)
+        x,t = self.image[idx],self.label[idx]
+        x   = (x-0.5)/1.0 # normalized to -0.5 ~ +0.5
+        if color:
+            x = np.expand_dims(x,axis=3)
+            x = np.tile(x,(1,1,3))
+        return x,t
+
+class CGAN:
     def __init__(self,isTraining,imageSize,args):
         self.nBatch = args.nBatch
         self.learnRate = args.learnRate
@@ -75,7 +97,7 @@ class DCGAN:
         return weight, bias
 
     def _conv2d(self, x, W, stride):
-        return tf.nn.conv2d(x, W, strides = [1, stride, stride, 1], padding = "VALID")
+        return tf.nn.conv2d(x, W, strides = [1, stride, stride, 1], padding = "SAME")
 
     def _deconv2d(self, x, W, output_shape, stride=1):
         # x           : [nBatch, height, width, in_channels]
@@ -96,7 +118,6 @@ class DCGAN:
         dim_1_h,dim_1_w = self.calcImageSize(dim_0_h, dim_0_w, stride=2)
         dim_2_h,dim_2_w = self.calcImageSize(dim_1_h, dim_1_w, stride=2)
         dim_3_h,dim_3_w = self.calcImageSize(dim_2_h, dim_2_w, stride=2)
-        dim_4_h,dim_4_w = self.calcImageSize(dim_3_h, dim_3_w, stride=2)
 
         h = z
 
@@ -104,18 +125,12 @@ class DCGAN:
             if reuse: scope.reuse_variables()
 
             # fc1
-            self.g_fc1_w, self.g_fc1_b = self._fc_variable([self.zdim,512*dim_4_h*dim_4_w],name="fc1")
+            self.g_fc1_w, self.g_fc1_b = self._fc_variable([self.zdim,256*dim_3_h*dim_3_w],name="fc1")
             h = tf.matmul(h, self.g_fc1_w) + self.g_fc1_b
             h = tf.nn.relu(h)
 
             #
-            h = tf.reshape(h,(self.nBatch,dim_4_h,dim_4_h,512))
-
-            # deconv4
-            self.g_deconv4_w, self.g_deconv4_b = self._deconv_variable([5,5,512,256],name="deconv4")
-            h = self._deconv2d(h,self.g_deconv4_w, output_shape=[self.nBatch,dim_3_h,dim_3_w,256], stride=2) + self.g_deconv4_b
-            h = tf.contrib.layers.batch_norm(h, decay=0.9, updates_collections=None, epsilon=1e-5, scale=True, is_training=isTraining, scope="gNorm4")
-            h = tf.nn.relu(h)
+            h = tf.reshape(h,(self.nBatch,dim_3_h,dim_3_h,256))
 
             # deconv3
             self.g_deconv3_w, self.g_deconv3_b = self._deconv_variable([5,5,256,128],name="deconv3")
@@ -146,8 +161,6 @@ class DCGAN:
                 tf.summary.histogram("g_deconv2_b"   ,self.g_deconv2_b)
                 tf.summary.histogram("g_deconv3_w"   ,self.g_deconv3_w)
                 tf.summary.histogram("g_deconv3_b"   ,self.g_deconv3_b)
-                tf.summary.histogram("g_deconv4_w"   ,self.g_deconv4_w)
-                tf.summary.histogram("g_deconv4_b"   ,self.g_deconv4_b)
 
         return y
 
@@ -174,12 +187,6 @@ class DCGAN:
             h = tf.contrib.layers.batch_norm(h, decay=0.9, updates_collections=None, epsilon=1e-5, scale=True, is_training=self.isTraining, scope="dNorm3")
             h = self.leakyReLU(h)
 
-            # conv4
-            self.d_conv4_w, self.d_conv4_b = self._conv_variable([5,5,256,512],name="conv4")
-            h = self._conv2d(h,self.d_conv4_w, stride=2) + self.d_conv4_b
-            h = tf.contrib.layers.batch_norm(h, decay=0.9, updates_collections=None, epsilon=1e-5, scale=True, is_training=self.isTraining, scope="dNorm4")
-            h = self.leakyReLU(h)
-
             # fc1
             n_b, n_h, n_w, n_f = [int(x) for x in h.get_shape()]
             h = tf.reshape(h,[self.nBatch,n_h*n_w*n_f])
@@ -196,8 +203,6 @@ class DCGAN:
                 tf.summary.histogram("d_conv2_b"   ,self.d_conv2_b)
                 tf.summary.histogram("d_conv3_w"   ,self.d_conv3_w)
                 tf.summary.histogram("d_conv3_b"   ,self.d_conv3_b)
-                tf.summary.histogram("d_conv4_w"   ,self.d_conv4_w)
-                tf.summary.histogram("d_conv4_b"   ,self.d_conv4_b)
 
         return h
 
@@ -230,7 +235,7 @@ class DCGAN:
 
         #############################
         # define session
-        config = tf.ConfigProto(gpu_options=tf.GPUOptions(per_process_gpu_memory_fraction=0.35))
+        config = tf.ConfigProto(gpu_options=tf.GPUOptions(per_process_gpu_memory_fraction=0.15))
         self.sess = tf.Session(config=config)
 
         #############################
